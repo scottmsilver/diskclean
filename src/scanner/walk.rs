@@ -734,12 +734,39 @@ fn detect_duplicates(candidates: &dashmap::DashMap<u64, Vec<PathBuf>>, tx: &Send
         // Emit duplicate groups (2+ files with same hash)
         for (_, group) in hash_groups {
             if group.len() < 2 { continue; }
+
+            // Check if these are APFS clones (shared physical blocks) — skip if so
+            // Clones: different inodes but same physical blocks = no real savings
+            let inodes: Vec<u64> = group.iter().filter_map(|p| {
+                fs::symlink_metadata(p).ok().map(|m| m.ino())
+            }).collect();
+            let unique_inodes = {
+                let mut v = inodes.clone();
+                v.sort(); v.dedup(); v.len()
+            };
+            if unique_inodes < 2 { continue; } // hardlinks — same inode, no savings
+
             let reclaimable = *size * (group.len() as u64 - 1); // keep one copy
-            let detail = group.iter()
+
+            // Classify safety: are all copies in caches/generated dirs?
+            let all_in_cache = group.iter().all(|p| {
+                let s = p.to_string_lossy();
+                s.contains("/Caches/") || s.contains("/cache/") || s.contains("/.cache/")
+                    || s.contains("/pkgs/") || s.contains("/Cache/")
+                    || s.contains("node_modules/") || s.contains("/venv/")
+                    || s.contains("/.venv/") || s.contains("/anaconda")
+                    || s.contains("/miniconda") || s.contains("/.npm/")
+                    || s.contains("/DerivedData/") || s.contains("/.cargo/")
+            });
+
+            let safety = if all_in_cache { "All copies in caches — safe to clean" }
+                else { "Review before deleting — may include user files" };
+
+            let paths_str = group.iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect::<Vec<_>>()
                 .join("\n");
-            // Report the first file as the "finding" path, with all paths in detail
+
             let _ = tx.send(ScanEvent::Found(Category::DuplicateFiles, Finding {
                 path: group[0].clone(),
                 physical_size: reclaimable,
@@ -747,7 +774,8 @@ fn detect_duplicates(candidates: &dashmap::DashMap<u64, Vec<PathBuf>>, tx: &Send
                 last_modified: None,
                 owner_uid: 0,
                 cloud_backed: false,
-                detail: format!("{} copies, {} each:\n{}", group.len(), bytesize::ByteSize(*size), detail),
+                detail: format!("{} copies, {} each — {}\n{}",
+                    group.len(), bytesize::ByteSize(*size), safety, paths_str),
             }));
         }
     }
