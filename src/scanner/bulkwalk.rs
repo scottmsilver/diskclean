@@ -80,8 +80,13 @@ fn open_subdir(parent_fd: libc::c_int, name: &str) -> libc::c_int {
 }
 
 /// Read directory entries from an already-open fd.
+/// Uses a thread-local reusable buffer to avoid 1MB allocation per call.
 fn list_dir_bulk_fd(fd: libc::c_int) -> Vec<EntryInfo> {
     let mut results = Vec::new();
+
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; 1024 * 1024]);
+    }
 
     let alist = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -94,10 +99,11 @@ fn list_dir_bulk_fd(fd: libc::c_int) -> Vec<EntryInfo> {
         forkattr: 0,
     };
 
-    let buf_size: usize = 1024 * 1024; // 1MB — fewer syscalls per large directory
-    let mut buf: Vec<u8> = vec![0u8; buf_size];
-
     let options: u64 = FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS;
+
+    BUF.with(|buf_cell| {
+    let mut buf = buf_cell.borrow_mut();
+    let buf_size = buf.len();
 
     loop {
         let count = unsafe {
@@ -188,6 +194,8 @@ fn list_dir_bulk_fd(fd: libc::c_int) -> Vec<EntryInfo> {
             offset += entry_len;
         }
     }
+
+    }); // BUF.with
 
     results
 }
