@@ -630,7 +630,7 @@ pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
                 if let Some(cat) = classify_path(path, name, true, depth) {
                     buckets.insert(path.to_path_buf(), BulkBucket {
                         category: cat, physical: 0, logical: 0,
-                        newest: None, cloud_backed: false,
+                        newest: None, cloud_backed: false, detail: String::new(),
                     });
                     return true;
                 }
@@ -638,7 +638,7 @@ pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
                 if depth >= 1 && depth <= 5 && path.join(".git").is_dir() {
                     buckets.insert(path.to_path_buf(), BulkBucket {
                         category: Category::StaleProject, physical: 0, logical: 0,
-                        newest: None, cloud_backed: false,
+                        newest: None, cloud_backed: false, detail: String::new(),
                     });
                     return true;
                 }
@@ -718,4 +718,269 @@ struct BulkBucket {
     logical: u64,
     newest: Option<SystemTime>,
     cloud_backed: bool,
+    detail: String,
+}
+
+/// Fast full-disk scan using getattrlistbulk. Called by spawn_scan.
+pub fn run_scan_fast(tx: Sender<ScanEvent>) {
+    use crate::scanner::bulkwalk;
+
+    let start = Instant::now();
+    let files_scanned = AtomicU64::new(0);
+    let dataless_skipped = AtomicU64::new(0);
+
+    let _ = tx.send(ScanEvent::Progress(ScanProgress {
+        phase: ScanPhase::DetectingApps,
+        files_scanned: 0, perm_errors: 0, dataless_skipped: 0,
+        elapsed: start.elapsed(),
+    }));
+    let installed_ids = get_installed_app_bundle_ids();
+
+    let homes = get_user_homes();
+    for home in &homes {
+        let user = home.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let _ = tx.send(ScanEvent::Progress(ScanProgress {
+            phase: ScanPhase::ScanningUser(user),
+            files_scanned: files_scanned.load(Ordering::Relaxed),
+            perm_errors: 0,
+            dataless_skipped: dataless_skipped.load(Ordering::Relaxed),
+            elapsed: start.elapsed(),
+        }));
+
+        let buckets: dashmap::DashMap<PathBuf, BulkBucket> = dashmap::DashMap::new();
+        let cutoff_90d = SystemTime::now() - Duration::from_secs(90 * 24 * 3600);
+
+        bulkwalk::walk_bulk_parallel(home, |path, entry| {
+            files_scanned.fetch_add(1, Ordering::Relaxed);
+            let name = &entry.name;
+
+            let parent_bucket = {
+                let mut ancestor = path.parent();
+                let mut found: Option<PathBuf> = None;
+                while let Some(a) = ancestor {
+                    if a.as_os_str().len() < home.as_os_str().len() { break; }
+                    if buckets.contains_key(a) {
+                        found = Some(a.to_path_buf());
+                        break;
+                    }
+                    ancestor = a.parent();
+                }
+                found
+            };
+
+            if entry.is_dir {
+                if parent_bucket.is_none() {
+                    let depth = path.strip_prefix(home).map(|p| p.components().count()).unwrap_or(0);
+
+                    if let Some(cat) = classify_path(path, name, true, depth) {
+                        if cat == Category::OldDownloads {
+                            return true; // descend, children get bucketed by age
+                        }
+                        let cloud_backed = cat == Category::CloudSyncedLocal
+                            && path.to_string_lossy().contains("Library/CloudStorage/");
+                        buckets.insert(path.to_path_buf(), BulkBucket {
+                            category: cat, physical: 0, logical: 0,
+                            newest: None, cloud_backed, detail: String::new(),
+                        });
+                        return true;
+                    }
+
+                    if depth >= 2 && depth <= 5 && path.join(".git").is_dir() {
+                        buckets.insert(path.to_path_buf(), BulkBucket {
+                            category: Category::StaleProject, physical: 0, logical: 0,
+                            newest: None, cloud_backed: false, detail: String::new(),
+                        });
+                        return true;
+                    }
+
+                    if path.to_string_lossy().contains("Library/Application Support/") && depth == 3 {
+                        let bundle_like = name.replace(' ', ".").to_lowercase();
+                        let is_installed = installed_ids.iter().any(|id| {
+                            id.to_lowercase().contains(&bundle_like) || bundle_like.contains(&id.to_lowercase())
+                        });
+                        if !is_installed {
+                            buckets.insert(path.to_path_buf(), BulkBucket {
+                                category: Category::OldAppLeftovers, physical: 0, logical: 0,
+                                newest: None, cloud_backed: false,
+                                detail: "App may no longer be installed".to_string(),
+                            });
+                            return true;
+                        }
+                    }
+
+                    if path.to_string_lossy().contains("Library/Caches/") && depth == 3 {
+                        buckets.insert(path.to_path_buf(), BulkBucket {
+                            category: Category::AppCache, physical: 0, logical: 0,
+                            newest: None, cloud_backed: false, detail: String::new(),
+                        });
+                        return true;
+                    }
+
+                    // Old download child dirs
+                    if depth == 2 && path.parent().map_or(false, |p| {
+                        p.file_name().map_or(false, |n| n == "Downloads")
+                    }) {
+                        if let Some(mt) = entry.modified {
+                            if mt < cutoff_90d {
+                                buckets.insert(path.to_path_buf(), BulkBucket {
+                                    category: Category::OldDownloads, physical: 0, logical: 0,
+                                    newest: entry.modified, cloud_backed: false,
+                                    detail: name.to_string(),
+                                });
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+
+            if entry.is_file {
+                if entry.is_dataless {
+                    dataless_skipped.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                let phys = entry.physical_size;
+                let logical = entry.logical_size;
+
+                if let Some(key) = parent_bucket {
+                    if let Some(mut bucket) = buckets.get_mut(&key) {
+                        bucket.physical += phys;
+                        bucket.logical += logical;
+                        if let Some(mt) = entry.modified {
+                            bucket.newest = Some(bucket.newest.map_or(mt, |n: SystemTime| n.max(mt)));
+                        }
+                    }
+                } else if phys > 200_000_000 {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                    let cat = if is_vm_ext(&ext) { Category::VmImages }
+                        else if is_media_ext(&ext) { Category::LargeMedia }
+                        else { Category::LargeOther };
+                    let cloud_backed = path.to_string_lossy().contains("CloudStorage")
+                        || path.to_string_lossy().contains("Mobile Documents");
+                    let _ = tx.send(ScanEvent::Found(cat, Finding {
+                        path: path.to_path_buf(), physical_size: phys, logical_size: logical,
+                        last_modified: entry.modified, owner_uid: 0,
+                        cloud_backed, detail: ext,
+                    }));
+                } else if phys > 500_000 {
+                    // Old download files
+                    if path.parent().map_or(false, |p| p.file_name().map_or(false, |n| n == "Downloads")) {
+                        if let Some(mt) = entry.modified {
+                            if mt < cutoff_90d {
+                                let _ = tx.send(ScanEvent::Found(Category::OldDownloads, Finding {
+                                    path: path.to_path_buf(), physical_size: phys, logical_size: logical,
+                                    last_modified: entry.modified, owner_uid: 0,
+                                    cloud_backed: false, detail: name.to_string(),
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        });
+
+        // Emit bucket findings
+        let six_months_ago = SystemTime::now() - Duration::from_secs(180 * 24 * 3600);
+        for entry in buckets.iter() {
+            let (bpath, bucket) = (entry.key(), entry.value());
+            match &bucket.category {
+                Category::StaleProject => {
+                    let is_stale = bucket.newest.map_or(true, |t| t < six_months_ago);
+                    if !is_stale || bucket.physical < 10_000_000 { continue; }
+                    let detail = check_git_dirty_fast(bpath);
+                    let _ = tx.send(ScanEvent::Found(Category::StaleProject, Finding {
+                        path: bpath.clone(), physical_size: bucket.physical, logical_size: bucket.logical,
+                        last_modified: bucket.newest, owner_uid: 0, cloud_backed: false, detail,
+                    }));
+                }
+                Category::OldAppLeftovers => {
+                    if bucket.physical < 10_000_000 { continue; }
+                    let _ = tx.send(ScanEvent::Found(bucket.category.clone(), Finding {
+                        path: bpath.clone(), physical_size: bucket.physical, logical_size: bucket.logical,
+                        last_modified: bucket.newest, owner_uid: 0, cloud_backed: false,
+                        detail: bucket.detail.clone(),
+                    }));
+                }
+                Category::AppCache => {
+                    if bucket.physical < 5_000_000 { continue; }
+                    let _ = tx.send(ScanEvent::Found(bucket.category.clone(), Finding {
+                        path: bpath.clone(), physical_size: bucket.physical, logical_size: bucket.logical,
+                        last_modified: bucket.newest, owner_uid: 0, cloud_backed: false, detail: String::new(),
+                    }));
+                }
+                Category::OldDownloads => {
+                    if bucket.physical < 500_000 { continue; }
+                    let _ = tx.send(ScanEvent::Found(bucket.category.clone(), Finding {
+                        path: bpath.clone(), physical_size: bucket.physical, logical_size: bucket.logical,
+                        last_modified: bucket.newest, owner_uid: 0, cloud_backed: false,
+                        detail: bucket.detail.clone(),
+                    }));
+                }
+                Category::CloudSyncedLocal => {
+                    if bucket.physical < 1_000_000 { continue; }
+                    let _ = tx.send(ScanEvent::Found(bucket.category.clone(), Finding {
+                        path: bpath.clone(), physical_size: bucket.physical, logical_size: bucket.logical,
+                        last_modified: bucket.newest, owner_uid: 0, cloud_backed: true,
+                        detail: format!("Synced to cloud — {} on disk", ByteSize(bucket.physical)),
+                    }));
+                }
+                cat => {
+                    if bucket.physical < 1_000_000 { continue; }
+                    let _ = tx.send(ScanEvent::Found(cat.clone(), Finding {
+                        path: bpath.clone(), physical_size: bucket.physical, logical_size: bucket.logical,
+                        last_modified: bucket.newest, owner_uid: 0,
+                        cloud_backed: bucket.cloud_backed, detail: bucket.detail.clone(),
+                    }));
+                }
+            }
+        }
+    }
+
+    // System dirs
+    let _ = tx.send(ScanEvent::Progress(ScanProgress {
+        phase: ScanPhase::ScanningSystem,
+        files_scanned: files_scanned.load(Ordering::Relaxed),
+        perm_errors: 0,
+        dataless_skipped: dataless_skipped.load(Ordering::Relaxed),
+        elapsed: start.elapsed(),
+    }));
+
+    for sys_path in &["/private/tmp", "/private/var/log", "/Library/Caches", "/Library/Logs", "/cores"] {
+        let p = Path::new(sys_path);
+        if !p.exists() { continue; }
+        let cat = if *sys_path == "/cores" { Category::CoreDumps }
+            else if sys_path.contains("tmp") { Category::TmpFiles }
+            else if sys_path.contains("log") || sys_path.contains("Logs") { Category::LogsAndDiagnostics }
+            else { Category::AppCache };
+        let (phys, logical, newest) = dir_physical_size(p);
+        if phys > 1_000_000 {
+            let _ = tx.send(ScanEvent::Found(cat, Finding {
+                path: p.to_path_buf(), physical_size: phys, logical_size: logical,
+                last_modified: newest, owner_uid: 0, cloud_backed: false, detail: String::new(),
+            }));
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("tmutil").args(["listlocalsnapshots", "/"]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let count = stdout.lines().filter(|l| l.contains("com.apple.TimeMachine")).count();
+        if count > 0 {
+            let _ = tx.send(ScanEvent::Found(Category::TimeMachineLocal, Finding {
+                path: PathBuf::from(format!("{} local snapshots", count)),
+                physical_size: 0, logical_size: 0, last_modified: None,
+                owner_uid: 0, cloud_backed: false,
+                detail: "Use 'sudo tmutil deletelocalsnapshots <date>'".to_string(),
+            }));
+        }
+    }
+
+    let _ = tx.send(ScanEvent::Complete(ScanResult {
+        categories: Vec::new(), grand_total: 0, safe_total: 0, cloud_total: 0,
+        files_scanned: files_scanned.load(Ordering::Relaxed),
+        perm_errors: 0,
+        dataless_skipped: dataless_skipped.load(Ordering::Relaxed),
+        elapsed: start.elapsed(),
+    }));
 }

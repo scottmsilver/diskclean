@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 pub fn spawn_scan() -> (JoinHandle<()>, Receiver<ScanEvent>) {
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
-        walk::run_scan(tx);
+        walk::run_scan_fast(tx);
     });
     (handle, rx)
 }
