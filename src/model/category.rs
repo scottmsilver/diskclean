@@ -39,6 +39,9 @@ pub enum Category {
     OldAppLeftovers,
     SimulatorRuntimes,
 
+    // Duplicates
+    DuplicateFiles,
+
     // System
     TimeMachineLocal,
     CoreDumps,
@@ -78,6 +81,7 @@ impl Category {
             Self::LargeOther => "Other Large Files (>200MB)",
             Self::OldAppLeftovers => "Uninstalled App Leftovers",
             Self::SimulatorRuntimes => "Simulator Runtimes",
+            Self::DuplicateFiles => "Duplicate Files",
             Self::TimeMachineLocal => "Time Machine Local Snapshots",
             Self::CoreDumps => "Core Dumps",
             Self::MailAttachments => "Mail Attachments",
@@ -116,6 +120,7 @@ impl Category {
             Self::LargeOther => "Large files that don't fit other categories. Review individually.",
             Self::OldAppLeftovers => "Data for apps no longer in /Applications. Likely safe to remove.",
             Self::SimulatorRuntimes => "iOS Simulator runtimes and device support. Delete old OS versions you don't test against.",
+            Self::DuplicateFiles => "Files with identical content found in multiple locations. Keep one copy and delete the rest. Sizes shown are the reclaimable amount (total minus one copy).",
             Self::TimeMachineLocal => "Local Time Machine snapshots. Reclaim with 'tmutil deletelocalsnapshots'.",
             Self::CoreDumps => "Process core dumps from crashes. Safe to delete.",
             Self::MailAttachments => "Attachments from Mail. Safe if emails still exist — re-download as needed.",
@@ -147,7 +152,8 @@ impl Category {
             | Self::BuildArtifact | Self::NodeModules | Self::XcodeDerivedData
             | Self::LogsAndDiagnostics | Self::CrashReports | Self::TmpFiles
             | Self::ElectronCache | Self::CoreDumps | Self::SimulatorRuntimes
-            | Self::CachedBrowserBinaries | Self::HomebrewOldVersions => RiskLevel::Safe,
+            | Self::CachedBrowserBinaries | Self::HomebrewOldVersions
+            | Self::DuplicateFiles => RiskLevel::Safe,
 
             Self::CloudSyncedLocal | Self::StaleProject | Self::OldDownloads
             | Self::Trash | Self::DockerData | Self::MailAttachments

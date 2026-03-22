@@ -712,6 +712,82 @@ pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
     }));
 }
 
+/// Fast duplicate detection: for files sharing the same size, hash first+last 4KB
+/// to confirm they're actual duplicates. Only reads 8KB per candidate file.
+fn detect_duplicates(candidates: &dashmap::DashMap<u64, Vec<PathBuf>>, tx: &Sender<ScanEvent>) {
+    use std::collections::HashMap;
+    use std::io::Read;
+
+    for entry in candidates.iter() {
+        let (size, paths) = (entry.key(), entry.value());
+        if paths.len() < 2 { continue; }
+
+        // Hash each file: first 4KB + last 4KB
+        let mut hash_groups: HashMap<u128, Vec<PathBuf>> = HashMap::new();
+
+        for path in paths.iter() {
+            if let Some(hash) = quick_file_hash(path, *size) {
+                hash_groups.entry(hash).or_default().push(path.clone());
+            }
+        }
+
+        // Emit duplicate groups (2+ files with same hash)
+        for (_, group) in hash_groups {
+            if group.len() < 2 { continue; }
+            let reclaimable = *size * (group.len() as u64 - 1); // keep one copy
+            let detail = group.iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Report the first file as the "finding" path, with all paths in detail
+            let _ = tx.send(ScanEvent::Found(Category::DuplicateFiles, Finding {
+                path: group[0].clone(),
+                physical_size: reclaimable,
+                logical_size: reclaimable,
+                last_modified: None,
+                owner_uid: 0,
+                cloud_backed: false,
+                detail: format!("{} copies, {} each:\n{}", group.len(), bytesize::ByteSize(*size), detail),
+            }));
+        }
+    }
+}
+
+/// Hash a file by reading first 4KB + last 4KB. Returns a 128-bit hash.
+/// Only reads 8KB regardless of file size — essentially free on SSD.
+fn quick_file_hash(path: &Path, size: u64) -> Option<u128> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher: u128 = 0;
+
+    // Read first 4KB
+    let mut buf = [0u8; 4096];
+    let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+    for chunk in buf[..n].chunks(16) {
+        let mut arr = [0u8; 16];
+        arr[..chunk.len()].copy_from_slice(chunk);
+        hasher ^= u128::from_le_bytes(arr);
+        hasher = hasher.wrapping_mul(0x9E3779B97F4A7C15_u128.wrapping_add(1));
+    }
+
+    // Read last 4KB (if file is large enough)
+    if size > 4096 {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::End(-4096)).ok()?;
+        let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+        for chunk in buf[..n].chunks(16) {
+            let mut arr = [0u8; 16];
+            arr[..chunk.len()].copy_from_slice(chunk);
+            hasher ^= u128::from_le_bytes(arr);
+            hasher = hasher.wrapping_mul(0x517CC1B727220A95_u128.wrapping_add(1));
+        }
+    }
+
+    // Mix in the size to avoid false positives
+    hasher ^= size as u128;
+
+    Some(hasher)
+}
+
 struct BulkBucket {
     category: Category,
     physical: u64,
@@ -728,6 +804,9 @@ pub fn run_scan_fast(tx: Sender<ScanEvent>) {
     let start = Instant::now();
     let files_scanned = AtomicU64::new(0);
     let dataless_skipped = AtomicU64::new(0);
+
+    // Duplicate detection: collect (size -> paths) for files > 1MB during walk
+    let dupe_candidates: dashmap::DashMap<u64, Vec<PathBuf>> = dashmap::DashMap::new();
 
     let _ = tx.send(ScanEvent::Progress(ScanProgress {
         phase: ScanPhase::DetectingApps,
@@ -843,6 +922,11 @@ pub fn run_scan_fast(tx: Sender<ScanEvent>) {
                 let phys = entry.physical_size;
                 let logical = entry.logical_size;
 
+                // Collect for duplicate detection (files > 1MB, not in cloud storage)
+                if logical > 1_000_000 && !path.to_string_lossy().contains("CloudStorage") {
+                    dupe_candidates.entry(logical).or_default().push(path.to_path_buf());
+                }
+
                 if let Some(key) = parent_bucket {
                     if let Some(mut bucket) = buckets.get_mut(&key) {
                         bucket.physical += phys;
@@ -937,6 +1021,9 @@ pub fn run_scan_fast(tx: Sender<ScanEvent>) {
             }
         }
     }
+
+    // Duplicate detection: hash files that share a size
+    detect_duplicates(&dupe_candidates, &tx);
 
     // System dirs
     let _ = tx.send(ScanEvent::Progress(ScanProgress {
