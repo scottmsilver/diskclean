@@ -590,45 +590,46 @@ pub fn run_scan_path(root: &Path, tx: Sender<ScanEvent>) {
     }));
 }
 
-/// Single-pass scan using getattrlistbulk (macOS) — no separate stat calls.
-/// Uses parallel top-level walk for speed.
+/// Single-pass scan using getattrlistbulk + rayon work-stealing at every level.
+/// DashMap for lock-free bucket accumulation.
 pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
     use crate::scanner::bulkwalk;
-    use std::sync::{Mutex, atomic::AtomicU64};
+    use dashmap::DashMap;
 
     let start = Instant::now();
     let files_scanned = AtomicU64::new(0);
     let dataless_skipped = AtomicU64::new(0);
-    let buckets: Mutex<Vec<(PathBuf, BulkBucket)>> = Mutex::new(Vec::new());
+
+    // DashMap keyed by bucket path — lock-free concurrent access
+    let buckets: DashMap<PathBuf, BulkBucket> = DashMap::new();
     let tx_ref = &tx;
 
     bulkwalk::walk_bulk_parallel(root, |path, entry| {
         files_scanned.fetch_add(1, Ordering::Relaxed);
         let name = &entry.name;
 
-        // Check bucket membership
-        let in_bucket = {
-            let bkts = buckets.lock().unwrap();
-            bkts.iter().rposition(|(prefix, _)| path.starts_with(prefix))
-        };
+        // Check bucket membership — iterate DashMap (lock-free reads)
+        let parent_bucket = buckets.iter()
+            .find(|e| path.starts_with(e.key()))
+            .map(|e| e.key().clone());
 
         if entry.is_dir {
-            if in_bucket.is_none() {
+            if parent_bucket.is_none() {
                 let depth = path.strip_prefix(root).map(|p| p.components().count()).unwrap_or(0);
 
                 if let Some(cat) = classify_path(path, name, true, depth) {
-                    buckets.lock().unwrap().push((path.to_path_buf(), BulkBucket {
+                    buckets.insert(path.to_path_buf(), BulkBucket {
                         category: cat, physical: 0, logical: 0,
                         newest: None, cloud_backed: false,
-                    }));
+                    });
                     return true;
                 }
 
                 if depth >= 1 && depth <= 5 && path.join(".git").is_dir() {
-                    buckets.lock().unwrap().push((path.to_path_buf(), BulkBucket {
+                    buckets.insert(path.to_path_buf(), BulkBucket {
                         category: Category::StaleProject, physical: 0, logical: 0,
                         newest: None, cloud_backed: false,
-                    }));
+                    });
                     return true;
                 }
             }
@@ -644,10 +645,8 @@ pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
             let phys = entry.physical_size;
             let logical = entry.logical_size;
 
-            if let Some(idx) = in_bucket {
-                let mut bkts = buckets.lock().unwrap();
-                if idx < bkts.len() {
-                    let bucket = &mut bkts[idx].1;
+            if let Some(key) = parent_bucket {
+                if let Some(mut bucket) = buckets.get_mut(&key) {
                     bucket.physical += phys;
                     bucket.logical += logical;
                     if let Some(mt) = entry.modified {
@@ -674,8 +673,8 @@ pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
 
     // Emit bucket findings
     let six_months_ago = SystemTime::now() - Duration::from_secs(180 * 24 * 3600);
-    let final_buckets = buckets.into_inner().unwrap();
-    for (path, bucket) in &final_buckets {
+    for entry in buckets.iter() {
+        let (path, bucket) = (entry.key(), entry.value());
         if bucket.category == Category::StaleProject {
             let is_stale = bucket.newest.map_or(true, |t| t < six_months_ago);
             if !is_stale || bucket.physical < 10_000_000 { continue; }

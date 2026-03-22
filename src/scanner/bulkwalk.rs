@@ -209,52 +209,35 @@ where
     }
 }
 
-/// Parallel version: walk top-level subdirectories concurrently using rayon,
-/// then switch to sequential walk within each subtree.
-/// The visitor is called from multiple threads — must be Send+Sync.
+/// Fully parallel walk using rayon work-stealing at EVERY level.
+/// Each directory's subdirs are submitted to rayon as parallel tasks,
+/// so the work-stealer automatically balances across cores.
 pub fn walk_bulk_parallel<F>(root: &Path, visitor: F)
+where
+    F: Fn(&Path, &EntryInfo) -> bool + Send + Sync,
+{
+    walk_parallel_inner(root, &visitor);
+}
+
+fn walk_parallel_inner<F>(dir: &Path, visitor: &F)
 where
     F: Fn(&Path, &EntryInfo) -> bool + Send + Sync,
 {
     use rayon::prelude::*;
 
-    // Get top-level entries
-    let entries = list_dir_bulk(root);
-
-    // Process all top-level entries, collect dirs
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for entry in &entries {
-        let child_path = root.join(&entry.name);
-        let descend = visitor(&child_path, entry);
-        if entry.is_dir && descend {
-            subdirs.push(child_path);
-        }
-    }
-
-    // Walk each top-level subdir in parallel
-    subdirs.par_iter().for_each(|subdir| {
-        walk_bulk_seq_with_fn(subdir, &visitor);
-    });
-}
-
-fn walk_bulk_seq_with_fn<F>(dir: &Path, visitor: &F)
-where
-    F: Fn(&Path, &EntryInfo) -> bool + Send + Sync,
-{
     let entries = list_dir_bulk(dir);
-    let mut subdirs: Vec<PathBuf> = Vec::new();
+    let subdirs: Vec<PathBuf> = entries.iter()
+        .filter_map(|entry| {
+            let child_path = dir.join(&entry.name);
+            let descend = visitor(&child_path, entry);
+            if entry.is_dir && descend { Some(child_path) } else { None }
+        })
+        .collect();
 
-    for entry in &entries {
-        let child_path = dir.join(&entry.name);
-        let descend = visitor(&child_path, entry);
-        if entry.is_dir && descend {
-            subdirs.push(child_path);
-        }
-    }
-
-    for subdir in subdirs {
-        walk_bulk_seq_with_fn(&subdir, visitor);
-    }
+    // Rayon work-stealing: each subdir is a task that can be stolen by idle threads
+    subdirs.par_iter().for_each(|subdir| {
+        walk_parallel_inner(subdir, visitor);
+    });
 }
 
 // ── Buffer reading helpers ──────────────────────────────────────────────────
