@@ -608,10 +608,20 @@ pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
         files_scanned.fetch_add(1, Ordering::Relaxed);
         let name = &entry.name;
 
-        // Check bucket membership — iterate DashMap (lock-free reads)
-        let parent_bucket = buckets.iter()
-            .find(|e| path.starts_with(e.key()))
-            .map(|e| e.key().clone());
+        // Check bucket membership by walking ancestor paths (O(depth) not O(buckets))
+        let parent_bucket = {
+            let mut ancestor = path.parent();
+            let mut found: Option<PathBuf> = None;
+            while let Some(a) = ancestor {
+                if a.as_os_str().len() < root.as_os_str().len() { break; }
+                if buckets.contains_key(a) {
+                    found = Some(a.to_path_buf());
+                    break;
+                }
+                ancestor = a.parent();
+            }
+            found
+        };
 
         if entry.is_dir {
             if parent_bucket.is_none() {

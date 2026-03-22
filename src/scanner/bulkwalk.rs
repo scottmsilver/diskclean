@@ -80,7 +80,7 @@ pub fn list_dir_bulk(path: &Path) -> Vec<EntryInfo> {
         forkattr: 0,
     };
 
-    let buf_size: usize = 256 * 1024;
+    let buf_size: usize = 1024 * 1024; // 1MB — fewer syscalls per large directory
     let mut buf: Vec<u8> = vec![0u8; buf_size];
 
     let options: u64 = FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS;
