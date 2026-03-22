@@ -59,15 +59,29 @@ pub struct EntryInfo {
 /// Walk a directory non-recursively using getattrlistbulk.
 /// Returns all entries with full metadata in one pass.
 pub fn list_dir_bulk(path: &Path) -> Vec<EntryInfo> {
-    let mut results = Vec::new();
-
     let c_path = match CString::new(path.as_os_str().as_bytes()) {
         Ok(p) => p,
-        Err(_) => return results,
+        Err(_) => return Vec::new(),
     };
-
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-    if fd < 0 { return results; }
+    if fd < 0 { return Vec::new(); }
+    let result = list_dir_bulk_fd(fd);
+    unsafe { libc::close(fd); }
+    result
+}
+
+/// Open a subdirectory relative to a parent fd (avoids full path resolution).
+fn open_subdir(parent_fd: libc::c_int, name: &str) -> libc::c_int {
+    let c_name = match CString::new(name.as_bytes()) {
+        Ok(n) => n,
+        Err(_) => return -1,
+    };
+    unsafe { libc::openat(parent_fd, c_name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) }
+}
+
+/// Read directory entries from an already-open fd.
+fn list_dir_bulk_fd(fd: libc::c_int) -> Vec<EntryInfo> {
+    let mut results = Vec::new();
 
     let alist = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -175,7 +189,6 @@ pub fn list_dir_bulk(path: &Path) -> Vec<EntryInfo> {
         }
     }
 
-    unsafe { libc::close(fd); }
     results
 }
 
@@ -210,33 +223,48 @@ where
 }
 
 /// Fully parallel walk using rayon work-stealing at EVERY level.
-/// Each directory's subdirs are submitted to rayon as parallel tasks,
-/// so the work-stealer automatically balances across cores.
+/// Uses openat() for subdirectories to avoid path resolution overhead.
 pub fn walk_bulk_parallel<F>(root: &Path, visitor: F)
 where
     F: Fn(&Path, &EntryInfo) -> bool + Send + Sync,
 {
-    walk_parallel_inner(root, &visitor);
+    let c_root = match CString::new(root.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let root_fd = unsafe { libc::open(c_root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if root_fd < 0 { return; }
+
+    walk_parallel_fd(root, root_fd, &visitor);
+    unsafe { libc::close(root_fd); }
 }
 
-fn walk_parallel_inner<F>(dir: &Path, visitor: &F)
+fn walk_parallel_fd<F>(dir: &Path, dir_fd: libc::c_int, visitor: &F)
 where
     F: Fn(&Path, &EntryInfo) -> bool + Send + Sync,
 {
     use rayon::prelude::*;
 
-    let entries = list_dir_bulk(dir);
-    let subdirs: Vec<PathBuf> = entries.iter()
+    let entries = list_dir_bulk_fd(dir_fd);
+    let subdirs: Vec<(PathBuf, String)> = entries.iter()
         .filter_map(|entry| {
             let child_path = dir.join(&entry.name);
             let descend = visitor(&child_path, entry);
-            if entry.is_dir && descend { Some(child_path) } else { None }
+            if entry.is_dir && descend {
+                Some((child_path, entry.name.clone()))
+            } else {
+                None
+            }
         })
         .collect();
 
-    // Rayon work-stealing: each subdir is a task that can be stolen by idle threads
-    subdirs.par_iter().for_each(|subdir| {
-        walk_parallel_inner(subdir, visitor);
+    // Rayon work-stealing with openat for each subdir
+    subdirs.par_iter().for_each(|(child_path, name)| {
+        let child_fd = open_subdir(dir_fd, name);
+        if child_fd >= 0 {
+            walk_parallel_fd(child_path, child_fd, visitor);
+            unsafe { libc::close(child_fd); }
+        }
     });
 }
 
