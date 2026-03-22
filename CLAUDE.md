@@ -50,11 +50,16 @@ grep -oE '[a-z_]+  \(in lib' /tmp/cpu.txt | sort | uniq -c | sort -rn | head -10
 | v6 ancestor-walk bucket lookup | 10.9s | 139 MB/s | O(depth) not O(buckets) |
 | **v7 1MB getattrlistbulk buffer** | **4.8s** | **TBD** | fewer syscalls per dir |
 
-## Current Profile (v7)
-- 4.8s wall, 2.75s user, 15.9s sys (across 8 cores)
-- getattrlistbulk dominates — this IS the useful work
-- open()/close() per directory is the second cost
-- Potential: openat() to avoid path resolution, or cache dir fds
+## Current Profile (v10)
+- 4.67s wall, 2.46s user, 15.0s sys (across 8 cores)
+- 50% getattrlistbulk (kernel APFS B-tree traversal)
+- 26% openat (directory open)
+- 6% malloc — now using thread-local reusable buffers
+- 0% mutex contention, 0% idle workers
+- Disk: 179 MB/s peak, ~4% of SSD capacity
+- Throughput: 280K files/sec
+- Bottleneck: kernel APFS catalog B-tree traversal cost (~3.5μs per file)
+- NO userspace bottlenecks remain — we're kernel-bound
 
 ## Architecture
 - `bulkwalk.rs`: macOS `getattrlistbulk()` with 1MB buffer
