@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use super::category::Category;
 use super::finding::Finding;
 use std::time::Duration;

@@ -175,24 +175,6 @@ pub fn classify_path(path: &Path, name: &str, is_dir: bool, depth: usize) -> Opt
     None
 }
 
-pub fn is_dev_project(path: &Path) -> bool {
-    let markers = [
-        "package.json", "Cargo.toml", "go.mod", "pom.xml", "build.gradle",
-        "build.gradle.kts", "Makefile", "CMakeLists.txt", "setup.py", "pyproject.toml",
-        "Gemfile", "composer.json", "Package.swift", "Podfile", "requirements.txt", "Pipfile",
-    ];
-    markers.iter().any(|m| path.join(m).exists()) || path.join(".git").is_dir()
-}
-
-pub fn has_git_uncommitted(path: &Path) -> Option<bool> {
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(path)
-        .output()
-        .ok()?;
-    Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
-}
-
 pub fn get_installed_app_bundle_ids() -> Vec<String> {
     let mut ids = Vec::new();
     for dir in &["/Applications", "/System/Applications"] {

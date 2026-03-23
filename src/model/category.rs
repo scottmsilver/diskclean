@@ -44,9 +44,12 @@ pub enum Category {
 
     // System
     TimeMachineLocal,
+    ApfsSnapshots,
     CoreDumps,
     MailAttachments,
     HomebrewOldVersions,
+    SystemTempFolders,
+    StaleStagingFolder,
 }
 
 impl Category {
@@ -83,9 +86,12 @@ impl Category {
             Self::SimulatorRuntimes => "Simulator Runtimes",
             Self::DuplicateFiles => "Duplicate Files",
             Self::TimeMachineLocal => "Time Machine Local Snapshots",
+            Self::ApfsSnapshots => "APFS Update Snapshots",
             Self::CoreDumps => "Core Dumps",
             Self::MailAttachments => "Mail Attachments",
             Self::HomebrewOldVersions => "Homebrew Old Versions",
+            Self::SystemTempFolders => "System Temp Folders (/var/folders)",
+            Self::StaleStagingFolder => "Stale Cleanup Staging Folder",
         }
     }
 
@@ -122,9 +128,12 @@ impl Category {
             Self::SimulatorRuntimes => "iOS Simulator runtimes and device support. Delete old OS versions you don't test against.",
             Self::DuplicateFiles => "Files with identical content found in multiple locations. Keep one copy and delete the rest. Sizes shown are the reclaimable amount (total minus one copy).",
             Self::TimeMachineLocal => "Local Time Machine snapshots. Reclaim with 'tmutil deletelocalsnapshots'.",
+            Self::ApfsSnapshots => "APFS snapshots from macOS updates. These hold a copy of the pre-update state and can use 5-20GB. Safe to delete after a successful update — macOS will recreate if needed.",
             Self::CoreDumps => "Process core dumps from crashes. Safe to delete.",
             Self::MailAttachments => "Attachments from Mail. Safe if emails still exist — re-download as needed.",
             Self::HomebrewOldVersions => "Old versions of Homebrew packages and bundled Ruby. Run 'brew cleanup --prune=all' to remove.",
+            Self::SystemTempFolders => "Per-user temp directories in /private/var/folders. Contains app temp data, caches, and build intermediates. The 'C' subfolder is caches, 'T' is temp. Safe to clean old items — apps recreate what they need.",
+            Self::StaleStagingFolder => "Leftover 'To Delete' folder from previous cleanup runs. Safe to delete — it's already-reviewed items that were staged but never purged.",
         }
     }
 
@@ -140,6 +149,8 @@ impl Category {
             Self::BrowserCache => Some("rm -rf ~/Library/Caches/Google/Chrome/Default/Cache/*"),
             Self::CondaInstall => Some("conda clean --all -y"),
             Self::HomebrewOldVersions => Some("brew cleanup --prune=all"),
+            Self::ApfsSnapshots => Some("sudo tmutil deletelocalsnapshots /"),
+            Self::StaleStagingFolder => Some("sudo rm -rf /private/var/root/To\\ Delete ~/To\\ Delete"),
             Self::RustupToolchains => Some("rustup toolchain list; rustup target list --installed"),
             Self::OldNodeVersions => Some("nvm ls  # then: nvm uninstall <version>"),
             _ => None,
@@ -153,7 +164,8 @@ impl Category {
             | Self::LogsAndDiagnostics | Self::CrashReports | Self::TmpFiles
             | Self::ElectronCache | Self::CoreDumps | Self::SimulatorRuntimes
             | Self::CachedBrowserBinaries | Self::HomebrewOldVersions
-            | Self::DuplicateFiles => RiskLevel::Safe,
+            | Self::DuplicateFiles | Self::StaleStagingFolder
+            | Self::SystemTempFolders => RiskLevel::Safe,
 
             Self::CloudSyncedLocal | Self::StaleProject | Self::OldDownloads
             | Self::Trash | Self::DockerData | Self::MailAttachments
@@ -162,7 +174,8 @@ impl Category {
             | Self::DartPubCache | Self::CondaInstall => RiskLevel::ReviewFirst,
 
             Self::IosDeviceBackup | Self::VmImages | Self::LargeMedia
-            | Self::LargeOther | Self::RustupToolchains | Self::AndroidSdk => RiskLevel::Caution,
+            | Self::LargeOther | Self::RustupToolchains | Self::AndroidSdk
+            | Self::ApfsSnapshots => RiskLevel::Caution,
         }
     }
 }

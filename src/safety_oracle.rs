@@ -115,6 +115,7 @@ Rules:
 }
 
 /// Batch-assess multiple items efficiently (one API call for up to 10 items).
+#[allow(dead_code)]
 pub fn batch_assess_safety(
     items: &[(String, String, u64, String, String)], // (category, path, size, detail, advice)
 ) -> Result<Vec<SafetyAssessment>, String> {

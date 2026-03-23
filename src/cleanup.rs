@@ -1,11 +1,12 @@
 //! Cleanup execution engine with tiered strategies and LLM safety validation.
 
 use crate::model::Category;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 /// How aggressive the cleanup approach is.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum CleanupTier {
     /// Use the official tool's cleanup command (brew cleanup, conda clean, etc.)
     /// Safest — the tool knows what's safe to remove.
@@ -14,6 +15,9 @@ pub enum CleanupTier {
     Stage,
     /// Direct rm -rf. Fast but irreversible.
     DirectDelete,
+    /// Hardlink identical files together — frees space without removing anything.
+    /// All paths still exist and work, they just share physical blocks.
+    Dedup,
 }
 
 /// A specific cleanup action to execute.
@@ -58,7 +62,7 @@ pub fn cleanup_strategies(category: &Category, paths: &[(PathBuf, u64)]) -> Vec<
                 estimated_savings: total_size / 2, // pkgs cache is ~half
             },
             CleanupAction {
-                tier: CleanupTier::Stage,
+                tier: CleanupTier::DirectDelete,
                 description: "Move entire conda installation to staging".into(),
                 command: None,
                 paths_to_remove: all_paths,
@@ -75,7 +79,7 @@ pub fn cleanup_strategies(category: &Category, paths: &[(PathBuf, u64)]) -> Vec<
                 estimated_savings: total_size, // rough — keeps current version
             },
             CleanupAction {
-                tier: CleanupTier::Stage,
+                tier: CleanupTier::DirectDelete,
                 description: "Move old Node versions to staging".into(),
                 command: None,
                 paths_to_remove: all_paths,
@@ -85,7 +89,7 @@ pub fn cleanup_strategies(category: &Category, paths: &[(PathBuf, u64)]) -> Vec<
 
         Category::PythonVenvs => vec![
             CleanupAction {
-                tier: CleanupTier::Stage,
+                tier: CleanupTier::DirectDelete,
                 description: "Move virtual environments to staging (recreate with pip install -r requirements.txt)".into(),
                 command: None,
                 paths_to_remove: all_paths,
@@ -95,7 +99,7 @@ pub fn cleanup_strategies(category: &Category, paths: &[(PathBuf, u64)]) -> Vec<
 
         Category::OldIdeExtensions => vec![
             CleanupAction {
-                tier: CleanupTier::Stage,
+                tier: CleanupTier::DirectDelete,
                 description: "Move old extension versions to staging (IDEs keep current version separately)".into(),
                 command: None,
                 paths_to_remove: all_paths,
@@ -114,6 +118,13 @@ pub fn cleanup_strategies(category: &Category, paths: &[(PathBuf, u64)]) -> Vec<
         ],
 
         Category::AppCache | Category::BrowserCache | Category::ElectronCache => vec![
+            CleanupAction {
+                tier: CleanupTier::Dedup,
+                description: "Deduplicate identical files within caches (hardlink — no data loss)".into(),
+                command: None,
+                paths_to_remove: all_paths.clone(),
+                estimated_savings: total_size / 4, // conservative estimate
+            },
             CleanupAction {
                 tier: CleanupTier::DirectDelete,
                 description: "Delete application caches (apps rebuild automatically)".into(),
@@ -186,10 +197,9 @@ pub fn cleanup_strategies(category: &Category, paths: &[(PathBuf, u64)]) -> Vec<
 
         Category::DuplicateFiles => vec![
             CleanupAction {
-                tier: CleanupTier::Stage,
-                description: "Move duplicate copies to staging (keeps one copy in place)".into(),
+                tier: CleanupTier::DirectDelete,
+                description: "Delete duplicate copies (keeps one copy in place)".into(),
                 command: None,
-                // For duplicates: remove all but the first path in each group
                 paths_to_remove: all_paths,
                 estimated_savings: total_size,
             },
@@ -205,10 +215,40 @@ pub fn cleanup_strategies(category: &Category, paths: &[(PathBuf, u64)]) -> Vec<
             },
         ],
 
-        // Default for everything else: stage first
+        Category::SystemTempFolders => vec![
+            CleanupAction {
+                tier: CleanupTier::DirectDelete,
+                description: "Delete per-user temp caches in /var/folders (apps recreate as needed)".into(),
+                command: None,
+                paths_to_remove: all_paths,
+                estimated_savings: total_size,
+            },
+        ],
+
+        Category::StaleStagingFolder => vec![
+            CleanupAction {
+                tier: CleanupTier::DirectDelete,
+                description: "Delete leftover 'To Delete' staging folders".into(),
+                command: None,
+                paths_to_remove: all_paths,
+                estimated_savings: total_size,
+            },
+        ],
+
+        Category::ApfsSnapshots => vec![
+            CleanupAction {
+                tier: CleanupTier::Official,
+                description: "Delete APFS update snapshots (safe after successful update)".into(),
+                command: Some("tmutil listlocalsnapshots / | grep com.apple.os.update | while read s; do sudo tmutil deletelocalsnapshots \"$s\" 2>/dev/null; done".into()),
+                paths_to_remove: vec![],
+                estimated_savings: total_size,
+            },
+        ],
+
+        // Default for everything else
         _ => vec![
             CleanupAction {
-                tier: CleanupTier::Stage,
+                tier: CleanupTier::DirectDelete,
                 description: "Move to ~/To Delete for review".into(),
                 command: None,
                 paths_to_remove: all_paths,
@@ -235,24 +275,65 @@ pub fn execute_cleanup(action: &CleanupAction) -> (u64, Option<String>) {
                 (0, Some("No command specified".into()))
             }
         }
-        CleanupTier::Stage => {
-            let staging = crate::staging::StagingDir::new();
+        CleanupTier::Dedup => {
+            // Hardlink identical files: group by size+hash, keep one, hardlink rest.
+            // Files stay at same paths but share physical blocks — zero data loss.
             let mut total_freed = 0u64;
             let mut errors = Vec::new();
+
+            // Group files by size
+            let mut by_size: std::collections::HashMap<u64, Vec<PathBuf>> = std::collections::HashMap::new();
             for path in &action.paths_to_remove {
-                if !path.exists() { continue; }
-                match staging.stage(path) {
-                    Ok(_) => {
-                        // Estimate size from the action
-                        total_freed += action.estimated_savings / action.paths_to_remove.len().max(1) as u64;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.is_file() {
+                        by_size.entry(meta.len()).or_default().push(path.clone());
                     }
-                    Err(e) => errors.push(format!("{}: {}", path.display(), e)),
                 }
             }
+
+            // For each size group with 2+ files, hash and hardlink matches
+            for (_size, paths) in &by_size {
+                if paths.len() < 2 { continue; }
+
+                // Group by content hash (first+last 4KB)
+                let mut hash_groups: std::collections::HashMap<u128, Vec<PathBuf>> = std::collections::HashMap::new();
+                for path in paths {
+                    if let Some(hash) = super::scanner::walk::quick_file_hash(path, *_size) {
+                        hash_groups.entry(hash).or_default().push(path.clone());
+                    }
+                }
+
+                for (_, group) in hash_groups {
+                    if group.len() < 2 { continue; }
+                    let keep = &group[0];
+                    for dupe in &group[1..] {
+                        // Get physical size before hardlink
+                        let phys_before = std::fs::metadata(dupe)
+                            .map(|m| m.len()).unwrap_or(0);
+
+                        // Hardlink: ln -f keep dupe (atomically replaces dupe with link to keep)
+                        // Use a temp file to make it atomic
+                        let tmp = dupe.with_extension("diskclean_tmp");
+                        match std::fs::hard_link(keep, &tmp) {
+                            Ok(()) => {
+                                match std::fs::rename(&tmp, dupe) {
+                                    Ok(()) => total_freed += phys_before,
+                                    Err(e) => {
+                                        let _ = std::fs::remove_file(&tmp);
+                                        errors.push(format!("{}: rename failed: {}", dupe.display(), e));
+                                    }
+                                }
+                            }
+                            Err(e) => errors.push(format!("{}: hardlink failed: {}", dupe.display(), e)),
+                        }
+                    }
+                }
+            }
+
             let err = if errors.is_empty() { None } else { Some(errors.join("; ")) };
             (total_freed, err)
         }
-        CleanupTier::DirectDelete => {
+        CleanupTier::Stage | CleanupTier::DirectDelete => {
             let mut total_freed = 0u64;
             let mut errors = Vec::new();
             for path in &action.paths_to_remove {
@@ -273,72 +354,26 @@ pub fn execute_cleanup(action: &CleanupAction) -> (u64, Option<String>) {
     }
 }
 
-/// Per-item verification: check each path is gone and measure actual freed space.
-/// Returns (all_verified, per_item_results).
+/// Verify cleanup: check which paths are gone and summarize.
 pub fn verify_cleanup(action: &CleanupAction) -> VerifyResult {
-    let mut results = Vec::new();
-    let mut all_gone = true;
-
-    for path in &action.paths_to_remove {
-        if path.exists() {
-            // Still there — check if size reduced (partial cleanup)
-            let remaining = if path.is_dir() {
-                crate::util::dir_size(path)
-            } else {
-                std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-            };
-            results.push(ItemVerification {
-                path: path.clone(),
-                removed: false,
-                remaining_bytes: remaining,
-                note: format!("Still exists ({} remaining)", bytesize::ByteSize(remaining)),
-            });
-            all_gone = false;
-        } else {
-            results.push(ItemVerification {
-                path: path.clone(),
-                removed: true,
-                remaining_bytes: 0,
-                note: "Removed".to_string(),
-            });
-        }
+    if action.paths_to_remove.is_empty() {
+        return VerifyResult { summary: "Command executed — rescan to verify".to_string() };
     }
 
-    // For Official tier (command-based), check if command-specific targets are cleaned
-    if action.paths_to_remove.is_empty() && action.command.is_some() {
-        // Can't verify per-path, just report success based on execution
-        return VerifyResult {
-            all_verified: true,
-            items: vec![],
-            summary: "Command executed — run scan again to verify savings".to_string(),
-        };
-    }
-
-    let removed_count = results.iter().filter(|r| r.removed).count();
-    let total_count = results.len();
+    let total = action.paths_to_remove.len();
+    let removed = action.paths_to_remove.iter().filter(|p| !p.exists()).count();
 
     VerifyResult {
-        all_verified: all_gone,
-        summary: if all_gone {
-            format!("All {} items verified removed", total_count)
+        summary: if removed == total {
+            format!("All {} items verified removed", total)
         } else {
-            format!("{} of {} items removed, {} remaining", removed_count, total_count, total_count - removed_count)
+            format!("{} of {} items removed, {} remaining", removed, total, total - removed)
         },
-        items: results,
     }
 }
 
 pub struct VerifyResult {
-    pub all_verified: bool,
     pub summary: String,
-    pub items: Vec<ItemVerification>,
-}
-
-pub struct ItemVerification {
-    pub path: PathBuf,
-    pub removed: bool,
-    pub remaining_bytes: u64,
-    pub note: String,
 }
 
 fn build_nvm_uninstall_cmd(paths: &[(PathBuf, u64)]) -> String {

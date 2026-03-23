@@ -2,6 +2,8 @@
 //! Returns directory entries with full metadata (name, type, size, flags, mtime)
 //! in a single syscall per directory — 4-5x faster than readdir + stat.
 
+#![allow(dead_code)] // list_dir_bulk, walk_bulk used by benchmarks
+
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -45,6 +47,7 @@ extern "C" {
 }
 
 /// Metadata for a single directory entry, returned by getattrlistbulk.
+#[allow(dead_code)]
 pub struct EntryInfo {
     pub name: String,
     pub is_dir: bool,

@@ -1,10 +1,11 @@
+#![allow(dead_code)] // run_scan, run_scan_path, run_scan_bulk used by benchmarks
+
 use crate::model::*;
 use crate::scanner::classify::*;
 use crate::util::{is_media_ext, is_vm_ext};
 use bytesize::ByteSize;
 use crossbeam_channel::Sender;
 use jwalk::WalkDir;
-use rayon::prelude::*;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "macos")]
@@ -462,7 +463,6 @@ pub fn run_scan(tx: Sender<ScanEvent>) {
 /// Single-pass scan: classify directories, then accumulate sizes from files
 /// that jwalk visits *inside* those directories. No double-walk.
 pub fn run_scan_path(root: &Path, tx: Sender<ScanEvent>) {
-    use std::collections::HashMap;
 
     let start = Instant::now();
     let files_scanned = AtomicU64::new(0);
@@ -716,7 +716,6 @@ pub fn run_scan_bulk(root: &Path, tx: Sender<ScanEvent>) {
 /// to confirm they're actual duplicates. Only reads 8KB per candidate file.
 fn detect_duplicates(candidates: &dashmap::DashMap<u64, Vec<PathBuf>>, tx: &Sender<ScanEvent>) {
     use std::collections::HashMap;
-    use std::io::Read;
 
     for entry in candidates.iter() {
         let (size, paths) = (entry.key(), entry.value());
@@ -746,7 +745,15 @@ fn detect_duplicates(candidates: &dashmap::DashMap<u64, Vec<PathBuf>>, tx: &Send
             };
             if unique_inodes < 2 { continue; } // hardlinks — same inode, no savings
 
-            let reclaimable = *size * (group.len() as u64 - 1); // keep one copy
+            // Use actual physical size (st_blocks * 512) for reclaimable calculation
+            let actual_phys_sizes: Vec<u64> = group.iter().filter_map(|p| {
+                fs::symlink_metadata(p).ok().map(|m| m.blocks() as u64 * 512)
+            }).collect();
+            // Only count files that actually use their own blocks (physical > 0)
+            let real_copies: u64 = actual_phys_sizes.iter().filter(|&&s| s > 0).count() as u64;
+            if real_copies < 2 { continue; } // fewer than 2 real copies
+            let reclaimable: u64 = actual_phys_sizes.iter().filter(|&&s| s > 0).sum::<u64>()
+                - actual_phys_sizes.iter().filter(|&&s| s > 0).max().copied().unwrap_or(0); // keep largest
 
             // Classify safety: are all copies in caches/generated dirs?
             let all_in_cache = group.iter().all(|p| {
@@ -783,7 +790,7 @@ fn detect_duplicates(candidates: &dashmap::DashMap<u64, Vec<PathBuf>>, tx: &Send
 
 /// Hash a file by reading first 4KB + last 4KB. Returns a 128-bit hash.
 /// Only reads 8KB regardless of file size — essentially free on SSD.
-fn quick_file_hash(path: &Path, size: u64) -> Option<u128> {
+pub fn quick_file_hash(path: &Path, size: u64) -> Option<u128> {
     let mut file = fs::File::open(path).ok()?;
     let mut hasher: u128 = 0;
 
@@ -814,6 +821,42 @@ fn quick_file_hash(path: &Path, size: u64) -> Option<u128> {
     hasher ^= size as u128;
 
     Some(hasher)
+}
+
+/// Estimate how much space APFS snapshots hold by comparing
+/// container used space vs sum of volume consumed space.
+fn estimate_snapshot_overhead() -> u64 {
+    let output2 = match std::process::Command::new("diskutil").args(["apfs", "list"]).output() {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+    let text = String::from_utf8_lossy(&output2.stdout);
+
+    let mut container_used: u64 = 0;
+    let mut volume_sum: u64 = 0;
+
+    for line in text.lines() {
+        if line.contains("Capacity In Use By Volumes:") {
+            if let Some(bytes) = extract_bytes(line) {
+                container_used = bytes;
+            }
+        }
+        if line.contains("Capacity Consumed:") {
+            if let Some(bytes) = extract_bytes(line) {
+                volume_sum += bytes;
+            }
+        }
+    }
+
+    container_used.saturating_sub(volume_sum)
+}
+
+fn extract_bytes(line: &str) -> Option<u64> {
+    // Finds pattern like "12345678 B" in parentheses
+    let start = line.find('(')? + 1;
+    let end = line.find(" B")?;
+    if start >= end { return None; }
+    line[start..end].trim().parse().ok()
 }
 
 struct BulkBucket {
@@ -950,9 +993,12 @@ pub fn run_scan_fast(tx: Sender<ScanEvent>) {
                 let phys = entry.physical_size;
                 let logical = entry.logical_size;
 
-                // Collect for duplicate detection (files > 1MB, not in cloud storage)
-                if logical > 1_000_000 && !path.to_string_lossy().contains("CloudStorage") {
-                    dupe_candidates.entry(logical).or_default().push(path.to_path_buf());
+                // Collect for duplicate detection: only USER content files.
+                // Skip if: inside a classified bucket, OR inside ~/Library (all app/system data).
+                // This is structural — no name-based heuristics.
+                let in_library = path.components().any(|c| c.as_os_str() == "Library");
+                if parent_bucket.is_none() && !in_library && phys > 1_000_000 {
+                    dupe_candidates.entry(phys).or_default().push(path.to_path_buf());
                 }
 
                 if let Some(key) = parent_bucket {
@@ -1062,6 +1108,7 @@ pub fn run_scan_fast(tx: Sender<ScanEvent>) {
         elapsed: start.elapsed(),
     }));
 
+    // Simple system dirs (small, sequential scan)
     for sys_path in &["/private/tmp", "/private/var/log", "/Library/Caches", "/Library/Logs", "/cores"] {
         let p = Path::new(sys_path);
         if !p.exists() { continue; }
@@ -1078,15 +1125,124 @@ pub fn run_scan_fast(tx: Sender<ScanEvent>) {
         }
     }
 
+    // /private/var/folders — per-user temp caches
+    // Scan C/ (caches) and T/ (temp) subdirs. Skip X/ (OS code signing).
+    // Only report items we can actually write to (avoids inflated estimates).
+    if let Ok(entries) = fs::read_dir("/private/var/folders") {
+        for entry in entries.flatten() {
+            if let Ok(sub_entries) = fs::read_dir(entry.path()) {
+                for sub in sub_entries.flatten() {
+                    for subdir_name in &["C", "T"] {
+                        let p = sub.path().join(subdir_name);
+                        if !p.exists() { continue; }
+                        // Only count items we can actually delete
+                        // Check: can we write to this directory?
+                        let writable = fs::metadata(&p).map(|m| {
+                            // On unix, check if we're root or owner
+                            use std::os::unix::fs::MetadataExt;
+                            let uid = unsafe { libc::geteuid() };
+                            uid == 0 || m.uid() == uid
+                        }).unwrap_or(false);
+                        if !writable { continue; }
+
+                        // Only count files older than 1 day
+                        let mut deletable_size: u64 = 0;
+                        let one_day_ago = SystemTime::now() - Duration::from_secs(86400);
+                        if let Ok(items) = fs::read_dir(&p) {
+                            for item in items.flatten() {
+                                if let Ok(meta) = item.metadata() {
+                                    let old = meta.modified().ok().map_or(true, |t| t < one_day_ago);
+                                    if old {
+                                        if meta.is_dir() {
+                                            deletable_size += dir_physical_size(&item.path()).0;
+                                        } else {
+                                            deletable_size += meta.len();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if deletable_size > 50_000_000 {
+                            let _ = tx.send(ScanEvent::Found(Category::SystemTempFolders, Finding {
+                                path: p, physical_size: deletable_size, logical_size: deletable_size,
+                                last_modified: None, owner_uid: 0, cloud_backed: false,
+                                detail: format!("{} subfolder — old caches/temp (>1 day)", subdir_name),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // /Library/Developer — only scan reclaimable parts, NOT CommandLineTools
+    // CommandLineTools is essential (git, clang, make all depend on it)
+    // CoreSimulator at system level may have old runtimes
+    {
+        let p = Path::new("/Library/Developer/CoreSimulator");
+        if p.exists() {
+            let (phys, logical, newest) = dir_physical_size(p);
+            if phys > 100_000_000 {
+                let _ = tx.send(ScanEvent::Found(Category::SimulatorRuntimes, Finding {
+                    path: p.to_path_buf(), physical_size: phys, logical_size: logical,
+                    last_modified: newest, owner_uid: 0, cloud_backed: false,
+                    detail: "System-level simulator runtimes".to_string(),
+                }));
+            }
+        }
+    }
+
+    // Stale staging folders (from previous cleanup runs)
+    for staging in &["/private/var/root/To Delete"] {
+        let p = Path::new(staging);
+        if !p.exists() { continue; }
+        let (phys, logical, newest) = dir_physical_size(p);
+        if phys > 1_000_000 {
+            let _ = tx.send(ScanEvent::Found(Category::StaleStagingFolder, Finding {
+                path: p.to_path_buf(), physical_size: phys, logical_size: logical,
+                last_modified: newest, owner_uid: 0, cloud_backed: false,
+                detail: "Leftover from previous cleanup — safe to delete".to_string(),
+            }));
+        }
+    }
+    // Also check each user's ~/To Delete
+    for home in &homes {
+        let p = home.join("To Delete");
+        if !p.exists() { continue; }
+        let (phys, logical, newest) = dir_physical_size(&p);
+        if phys > 1_000_000 {
+            let _ = tx.send(ScanEvent::Found(Category::StaleStagingFolder, Finding {
+                path: p, physical_size: phys, logical_size: logical,
+                last_modified: newest, owner_uid: 0, cloud_backed: false,
+                detail: "Leftover from previous cleanup — safe to delete".to_string(),
+            }));
+        }
+    }
+
+    // APFS snapshots
     if let Ok(output) = std::process::Command::new("tmutil").args(["listlocalsnapshots", "/"]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let count = stdout.lines().filter(|l| l.contains("com.apple.TimeMachine")).count();
-        if count > 0 {
+        let tm_snapshots: Vec<&str> = stdout.lines().filter(|l| l.contains("com.apple.TimeMachine")).collect();
+        let update_snapshots: Vec<&str> = stdout.lines().filter(|l| l.contains("com.apple.os.update")).collect();
+
+        if !tm_snapshots.is_empty() {
             let _ = tx.send(ScanEvent::Found(Category::TimeMachineLocal, Finding {
-                path: PathBuf::from(format!("{} local snapshots", count)),
+                path: PathBuf::from(format!("{} Time Machine snapshots", tm_snapshots.len())),
                 physical_size: 0, logical_size: 0, last_modified: None,
                 owner_uid: 0, cloud_backed: false,
                 detail: "Use 'sudo tmutil deletelocalsnapshots <date>'".to_string(),
+            }));
+        }
+
+        if !update_snapshots.is_empty() {
+            // Estimate snapshot size: container_used - sum_of_volume_consumed
+            let snap_size = estimate_snapshot_overhead();
+            let _ = tx.send(ScanEvent::Found(Category::ApfsSnapshots, Finding {
+                path: PathBuf::from(format!("{} OS update snapshots", update_snapshots.len())),
+                physical_size: snap_size, logical_size: snap_size, last_modified: None,
+                owner_uid: 0, cloud_backed: false,
+                detail: format!("{} APFS update snapshots (~{} estimated overhead)\nUse: sudo tmutil deletelocalsnapshots /",
+                    update_snapshots.len(), ByteSize(snap_size)),
             }));
         }
     }

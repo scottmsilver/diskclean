@@ -1,4 +1,7 @@
+use crate::cleanup::{self, CleanupAction};
+use crate::cleanup_queue::CleanupQueue;
 use crate::model::*;
+use crate::safety_oracle;
 use crate::staging::StagingDir;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -10,10 +13,33 @@ pub enum Screen {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Dialog {
     None,
-    ConfirmStage,          // "Move N items (X) to ~/To Delete?"
-    StageResult(String),   // Success/error message
+    ConfirmStage,                      // legacy: "Move N items (X) to ~/To Delete?"
+    StageResult(String),               // legacy: Success/error message
+    CleanupPicker,                     // show cleanup strategies for selected category
+    LlmAssessing,                      // "Asking Gemini..."
+    LlmResult(LlmAssessmentResult),   // show LLM verdict
+    CleanupConfirm(usize),            // confirm executing strategy index
+    CleanupRunning,                    // "Cleaning up..."
+    CleanupDone(CleanupResult),       // show what was cleaned + verification
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LlmAssessmentResult {
+    pub safe: bool,
+    pub confidence: String,
+    pub reasoning: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CleanupResult {
+    pub strategy: String,
+    pub bytes_freed: u64,
+    pub error: Option<String>,
+    pub verification: String,
 }
 
 pub struct CategoryRow {
@@ -34,7 +60,6 @@ pub struct App {
     pub categories: Vec<CategoryRow>,
     pub selected: usize,
     pub expanded: HashSet<usize>,
-    pub finding_offset: usize,
     pub grand_total: u64,
     pub safe_total: u64,
     pub cloud_total: u64,
@@ -47,6 +72,12 @@ pub struct App {
     pub staging: StagingDir,
     pub staged_count: usize,  // items moved so far this session
     pub staged_size: u64,
+
+    // Cleanup engine
+    pub cleanup_strategies: Vec<CleanupAction>,  // strategies for current selection
+    pub cleanup_selected_strategy: usize,        // which strategy is highlighted
+    pub cleanup_queue: CleanupQueue,             // async job queue
+    pub show_jobs: bool,                         // toggle jobs panel
 
     pub should_quit: bool,
     pub show_help: bool,
@@ -68,7 +99,6 @@ impl App {
             categories: Vec::new(),
             selected: 0,
             expanded: HashSet::new(),
-            finding_offset: 0,
             grand_total: 0,
             safe_total: 0,
             cloud_total: 0,
@@ -79,6 +109,10 @@ impl App {
             staging: StagingDir::new(),
             staged_count: 0,
             staged_size: 0,
+            cleanup_strategies: Vec::new(),
+            cleanup_selected_strategy: 0,
+            cleanup_queue: CleanupQueue::new(),
+            show_jobs: false,
             should_quit: false,
             show_help: false,
         }
@@ -303,5 +337,139 @@ impl App {
             format!("Moved {} items, {} errors. First error: {}", moved, errors.len(), errors[0])
         };
         self.dialog = Dialog::StageResult(msg);
+    }
+
+    // ── Cleanup workflow ────────────────────────────────────────────
+
+    /// Open cleanup strategy picker for the selected category.
+    pub fn open_cleanup_picker(&mut self) {
+        let Some((ci, _fi)) = self.selection_to_indices() else { return };
+        let cat_row = &self.categories[ci];
+
+        let paths: Vec<(std::path::PathBuf, u64)> = cat_row.findings.iter()
+            .map(|f| (f.path.clone(), f.physical_size))
+            .collect();
+
+        self.cleanup_strategies = cleanup::cleanup_strategies(&cat_row.category, &paths);
+        self.cleanup_selected_strategy = 0;
+        self.dialog = Dialog::CleanupPicker;
+    }
+
+    /// Add selected strategy to the job queue (doesn't execute yet).
+    pub fn queue_cleanup(&mut self) {
+        let idx = self.cleanup_selected_strategy;
+        if idx >= self.cleanup_strategies.len() { return; }
+
+        let strategy = self.cleanup_strategies[idx].clone();
+        let cat_name = self.selection_to_indices()
+            .map(|(ci, _)| self.categories[ci].category.label().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        self.cleanup_queue.enqueue(&cat_name, strategy);
+        self.show_jobs = true;
+        self.dialog = Dialog::None;
+    }
+
+    /// Move strategy selection up/down in the picker.
+    pub fn cleanup_picker_up(&mut self) {
+        if self.cleanup_selected_strategy > 0 {
+            self.cleanup_selected_strategy -= 1;
+        }
+    }
+
+    pub fn cleanup_picker_down(&mut self) {
+        if self.cleanup_selected_strategy + 1 < self.cleanup_strategies.len() {
+            self.cleanup_selected_strategy += 1;
+        }
+    }
+
+    /// Ask LLM to assess the selected strategy (if API key available).
+    pub fn assess_with_llm(&mut self) {
+        let Some((ci, _)) = self.selection_to_indices() else { return };
+        let cat_row = &self.categories[ci];
+        let strategy = &self.cleanup_strategies[self.cleanup_selected_strategy];
+
+        let path_str = if strategy.paths_to_remove.is_empty() {
+            strategy.command.as_deref().unwrap_or("(command)").to_string()
+        } else {
+            strategy.paths_to_remove.first()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+
+        self.dialog = Dialog::LlmAssessing;
+
+        // Try calling the oracle
+        match safety_oracle::assess_safety(
+            cat_row.category.label(),
+            &path_str,
+            strategy.estimated_savings,
+            &strategy.description,
+            cat_row.category.advice(),
+        ) {
+            Ok(assessment) => {
+                self.dialog = Dialog::LlmResult(LlmAssessmentResult {
+                    safe: assessment.safe,
+                    confidence: format!("{:.0}%", assessment.confidence * 100.0),
+                    reasoning: assessment.reasoning,
+                    warnings: assessment.warnings,
+                });
+            }
+            Err(e) => {
+                self.dialog = Dialog::LlmResult(LlmAssessmentResult {
+                    safe: false,
+                    confidence: "N/A".into(),
+                    reasoning: format!("LLM unavailable: {}", e),
+                    warnings: vec!["Set GEMINI_API_KEY to enable AI safety checks".into()],
+                });
+            }
+        }
+    }
+
+    /// Confirm and execute the selected cleanup strategy.
+    pub fn confirm_cleanup(&mut self) {
+        self.dialog = Dialog::CleanupConfirm(self.cleanup_selected_strategy);
+    }
+
+    /// Enqueue the cleanup job (runs in background, non-blocking).
+    pub fn execute_cleanup(&mut self) {
+        let idx = match &self.dialog {
+            Dialog::CleanupConfirm(i) => *i,
+            _ => return,
+        };
+
+        if idx >= self.cleanup_strategies.len() { return; }
+
+        let strategy = self.cleanup_strategies[idx].clone();
+        let cat_name = self.selection_to_indices()
+            .map(|(ci, _)| self.categories[ci].category.label().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Enqueue — runs async in background thread
+        let _job_id = self.cleanup_queue.enqueue(&cat_name, strategy);
+
+        // Show jobs panel and dismiss dialog
+        self.show_jobs = true;
+        self.dialog = Dialog::None;
+    }
+
+    /// Refresh category sizes based on what jobs have cleaned.
+    /// Called periodically from the TUI tick.
+    pub fn refresh_after_cleanup(&mut self) {
+        // Only refresh if there are completed jobs
+        let freed = self.cleanup_queue.total_freed();
+        if freed == 0 { return; }
+
+        // Re-check which findings still exist
+        for cat in &mut self.categories {
+            cat.findings.retain(|f| f.path.exists());
+            cat.total_size = cat.findings.iter().map(|f| f.physical_size).sum();
+        }
+        self.categories.retain(|c| c.total_size > 0 || c.category == Category::TimeMachineLocal);
+
+        self.grand_total = self.categories.iter().map(|c| c.total_size).sum();
+        self.safe_total = self.categories.iter()
+            .filter(|c| c.category.risk_level() == RiskLevel::Safe)
+            .map(|c| c.total_size).sum();
     }
 }

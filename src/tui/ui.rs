@@ -1,5 +1,7 @@
 use crate::model::*;
-use crate::tui::app::{App, Dialog, Screen};
+use crate::cleanup::CleanupTier;
+use crate::cleanup_queue::JobStatus;
+use crate::tui::app::{App, CleanupResult, Dialog, LlmAssessmentResult, Screen};
 use crate::util::{format_age, username_from_uid};
 use bytesize::ByteSize;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -26,6 +28,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.dialog {
         Dialog::ConfirmStage => draw_confirm_dialog(frame, app),
         Dialog::StageResult(msg) => draw_result_dialog(frame, msg),
+        Dialog::CleanupPicker => draw_cleanup_picker(frame, app),
+        Dialog::LlmAssessing => draw_llm_assessing(frame),
+        Dialog::LlmResult(result) => draw_llm_result(frame, result),
+        Dialog::CleanupConfirm(idx) => draw_cleanup_confirm(frame, app, *idx),
+        Dialog::CleanupRunning => draw_llm_assessing(frame), // reuse spinner
+        Dialog::CleanupDone(result) => draw_cleanup_done(frame, result),
         Dialog::None => {}
     }
 }
@@ -128,11 +136,16 @@ fn draw_scanning(frame: &mut Frame, app: &App) {
 fn draw_results(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
+    let jobs = app.cleanup_queue.snapshot();
+    let show_jobs = app.show_jobs && !jobs.is_empty();
+    let jobs_height = if show_jobs { (jobs.len() as u16 + 3).min(10) } else { 0 };
+
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(10),
+            Constraint::Length(jobs_height),
             Constraint::Length(3),
         ])
         .split(area);
@@ -146,7 +159,12 @@ fn draw_results(frame: &mut Frame, app: &App) {
 
     draw_category_list(frame, panels[0], app);
     draw_detail_panel(frame, panels[1], app);
-    draw_summary_bar(frame, main_chunks[2], app);
+
+    if show_jobs {
+        draw_jobs_panel(frame, main_chunks[2], &jobs);
+    }
+
+    draw_summary_bar(frame, main_chunks[3], app);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -438,6 +456,24 @@ fn draw_summary_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("{}", ByteSize(app.grand_total)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
     ];
 
+    let queued = app.cleanup_queue.snapshot().iter().filter(|j| j.status == JobStatus::Pending).count();
+    if queued > 0 {
+        spans.push(Span::styled(" │ Queued: ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            format!("{}", queued),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let freed = app.cleanup_queue.total_freed();
+    if freed > 0 {
+        spans.push(Span::styled(" │ Freed: ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            format!("{}", ByteSize(freed)),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if !app.marked.is_empty() {
         spans.push(Span::styled(" │ Marked: ", Style::default().fg(DIM)));
         spans.push(Span::styled(
@@ -464,10 +500,12 @@ fn draw_summary_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" nav  ", Style::default().fg(DIM)),
         Span::styled("⏎", Style::default().fg(CYAN)),
         Span::styled(" expand  ", Style::default().fg(DIM)),
+        Span::styled("c", Style::default().fg(Color::Green)),
+        Span::styled(" clean  ", Style::default().fg(DIM)),
         Span::styled("d", Style::default().fg(MARK_COLOR)),
         Span::styled(" mark  ", Style::default().fg(DIM)),
-        Span::styled("D", Style::default().fg(MARK_COLOR)),
-        Span::styled(" move to ~/To Delete  ", Style::default().fg(DIM)),
+        Span::styled("X", Style::default().fg(Color::Red)),
+        Span::styled(" run all  ", Style::default().fg(DIM)),
         Span::styled("?", Style::default().fg(CYAN)),
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("q", Style::default().fg(CYAN)),
@@ -598,6 +636,226 @@ fn draw_help_overlay(frame: &mut Frame) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(CYAN)));
     frame.render_widget(help, popup);
+}
+
+// ── Jobs panel ──────────────────────────────────────────────────────────────
+
+fn draw_jobs_panel(frame: &mut Frame, area: Rect, jobs: &[crate::cleanup_queue::CleanupJob]) {
+    let items: Vec<ListItem> = jobs.iter().map(|job| {
+        let status_style = match &job.status {
+            JobStatus::Pending => Style::default().fg(DIM),
+            JobStatus::Running => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            JobStatus::Done => Style::default().fg(Color::Green),
+            JobStatus::Failed(_) => Style::default().fg(Color::Red),
+        };
+
+        let pre = ByteSize(job.pre_size).to_string();
+        let post = job.post_size.map(|s| ByteSize(s).to_string()).unwrap_or_else(|| "...".into());
+        let freed = if job.bytes_freed > 0 { format!(" freed {}", ByteSize(job.bytes_freed)) } else { String::new() };
+        let verify = job.verification.as_deref().unwrap_or("");
+
+        ListItem::new(Line::from(vec![
+            Span::styled(format!(" {:>6} ", job.status_str()), status_style),
+            Span::styled(&job.category, Style::default().fg(Color::White)),
+            Span::styled(format!("  {} → {}{}", pre, post, freed), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("  {}", verify), Style::default().fg(DIM)),
+            Span::styled(format!("  {}", job.elapsed_str()), Style::default().fg(DIM)),
+        ]))
+    }).collect();
+
+    let total_freed: u64 = jobs.iter().filter(|j| j.status == JobStatus::Done).map(|j| j.bytes_freed).sum();
+    let active = jobs.iter().filter(|j| matches!(j.status, JobStatus::Pending | JobStatus::Running)).count();
+
+    let title = if active > 0 {
+        format!(" Jobs ({} active, {} freed) ", active, ByteSize(total_freed))
+    } else {
+        format!(" Jobs ({} freed) ", ByteSize(total_freed))
+    };
+
+    let list = List::new(items)
+        .block(Block::default()
+            .title(title)
+            .title_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DIM)));
+    frame.render_widget(list, area);
+}
+
+// ── Cleanup dialogs ─────────────────────────────────────────────────────────
+
+fn popup_rect(frame: &Frame, w: u16, h: u16) -> Rect {
+    let area = frame.area();
+    let w = w.min(area.width.saturating_sub(4));
+    let h = h.min(area.height.saturating_sub(4));
+    Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h)
+}
+
+fn draw_cleanup_picker(frame: &mut Frame, app: &App) {
+    let popup = popup_rect(frame, 70, (app.cleanup_strategies.len() as u16 * 3 + 8).min(20));
+    frame.render_widget(Clear, popup);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(" Choose cleanup strategy:", Style::default().fg(CYAN).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+
+    for (i, strategy) in app.cleanup_strategies.iter().enumerate() {
+        let selected = i == app.cleanup_selected_strategy;
+        let tier_label = match strategy.tier {
+            CleanupTier::Official => "[Official]",
+            CleanupTier::Stage => "[Stage]",
+            CleanupTier::DirectDelete => "[Delete]",
+            CleanupTier::Dedup => "[Dedup]",
+        };
+        let tier_color = match strategy.tier {
+            CleanupTier::Official => Color::Green,
+            CleanupTier::Dedup => Color::Cyan,
+            CleanupTier::Stage => Color::Yellow,
+            CleanupTier::DirectDelete => Color::Red,
+        };
+
+        let prefix = if selected { " > " } else { "   " };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(if selected { CYAN } else { DIM })),
+            Span::styled(tier_label, Style::default().fg(tier_color).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(&strategy.description, Style::default().fg(Color::White)),
+            Span::styled(format!(" (~{})", ByteSize(strategy.estimated_savings)), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Enter", Style::default().fg(CYAN)),
+        Span::styled(" add to queue  ", Style::default().fg(DIM)),
+        Span::styled("a", Style::default().fg(Color::Blue)),
+        Span::styled(" AI assess  ", Style::default().fg(DIM)),
+        Span::styled("Esc", Style::default().fg(CYAN)),
+        Span::styled(" cancel", Style::default().fg(DIM)),
+    ]));
+
+    let dialog = Paragraph::new(lines)
+        .block(Block::default()
+            .title(" Cleanup ")
+            .title_style(Style::default().fg(CYAN))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(CYAN)));
+    frame.render_widget(dialog, popup);
+}
+
+fn draw_llm_assessing(frame: &mut Frame) {
+    let popup = popup_rect(frame, 40, 5);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(" Asking Gemini 3.1 Pro...", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+    let dialog = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Blue)));
+    frame.render_widget(dialog, popup);
+}
+
+fn draw_llm_result(frame: &mut Frame, result: &LlmAssessmentResult) {
+    let popup = popup_rect(frame, 65, 14);
+    frame.render_widget(Clear, popup);
+
+    let safe_color = if result.safe { Color::Green } else { Color::Red };
+    let safe_text = if result.safe { "SAFE" } else { "NOT SAFE" };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Gemini says: ", Style::default().fg(DIM)),
+            Span::styled(safe_text, Style::default().fg(safe_color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" ({})", result.confidence), Style::default().fg(DIM)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(format!(" {}", result.reasoning), Style::default().fg(Color::White))),
+        Line::from(""),
+    ];
+
+    for w in &result.warnings {
+        lines.push(Line::from(Span::styled(format!(" ⚠ {}", w), Style::default().fg(Color::Yellow))));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Enter/y", Style::default().fg(CYAN)),
+        Span::styled(" proceed  ", Style::default().fg(DIM)),
+        Span::styled("n/Esc", Style::default().fg(CYAN)),
+        Span::styled(" back", Style::default().fg(DIM)),
+    ]));
+
+    let dialog = Paragraph::new(lines)
+        .block(Block::default()
+            .title(" AI Safety Assessment ")
+            .title_style(Style::default().fg(Color::Blue))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)));
+    frame.render_widget(dialog, popup);
+}
+
+fn draw_cleanup_confirm(frame: &mut Frame, app: &App, idx: usize) {
+    let popup = popup_rect(frame, 60, 8);
+    frame.render_widget(Clear, popup);
+
+    let strategy = app.cleanup_strategies.get(idx);
+    let desc = strategy.map(|s| s.description.as_str()).unwrap_or("unknown");
+    let savings = strategy.map(|s| ByteSize(s.estimated_savings).to_string()).unwrap_or_default();
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!(" Execute: {}", desc), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!(" Estimated savings: {}", savings), Style::default().fg(Color::Yellow))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled("[Y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Execute    ", Style::default().fg(Color::White)),
+            Span::styled("[N]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" Cancel", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(lines)
+        .block(Block::default()
+            .title(" Confirm Cleanup ")
+            .title_style(Style::default().fg(MARK_COLOR))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MARK_COLOR)));
+    frame.render_widget(dialog, popup);
+}
+
+fn draw_cleanup_done(frame: &mut Frame, result: &CleanupResult) {
+    let popup = popup_rect(frame, 65, 10);
+    frame.render_widget(Clear, popup);
+
+    let has_error = result.error.is_some();
+    let color = if has_error { Color::Yellow } else { Color::Green };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!(" Strategy: {}", result.strategy), Style::default().fg(Color::White))),
+        Line::from(Span::styled(format!(" Freed: {}", ByteSize(result.bytes_freed)), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!(" Verified: {}", result.verification), Style::default().fg(color))),
+    ];
+
+    if let Some(err) = &result.error {
+        lines.push(Line::from(Span::styled(format!(" Error: {}", err), Style::default().fg(Color::Red))));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" Press any key to continue", Style::default().fg(DIM))));
+
+    let dialog = Paragraph::new(lines)
+        .block(Block::default()
+            .title(if has_error { " Cleanup (with errors) " } else { " Cleanup Complete " })
+            .title_style(Style::default().fg(color))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color)));
+    frame.render_widget(dialog, popup);
 }
 
 fn textwrap(s: &str, width: usize) -> Vec<String> {

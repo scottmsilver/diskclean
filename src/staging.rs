@@ -9,6 +9,7 @@ pub struct StagingDir {
     caller_gid: u32,
 }
 
+#[allow(dead_code)]
 impl StagingDir {
     pub fn new() -> Self {
         let (uid, gid, home) = crate::caller_info();

@@ -1,4 +1,5 @@
 pub mod cleanup;
+pub mod cleanup_queue;
 pub mod model;
 pub mod safety_oracle;
 pub mod scanner;

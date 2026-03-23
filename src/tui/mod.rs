@@ -38,6 +38,10 @@ pub fn run_tui() -> io::Result<()> {
         select! {
             recv(tick_rx) -> _ => {
                 app.tick();
+                // Refresh sizes after cleanup jobs complete
+                if app.show_jobs {
+                    app.refresh_after_cleanup();
+                }
                 while event::poll(Duration::ZERO)? {
                     if let Event::Key(key) = event::read()? {
                         handle_key(&mut app, key);
@@ -99,21 +103,48 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
     match &app.dialog {
         Dialog::ConfirmStage => {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    app.execute_stage();
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    app.dialog = Dialog::None;
-                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.execute_stage(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.dialog = Dialog::None,
                 _ => {}
             }
             return;
         }
-        Dialog::StageResult(_) => {
-            // Any key dismisses the result dialog
+        Dialog::StageResult(_) | Dialog::CleanupDone(_) => {
             app.dialog = Dialog::None;
             return;
         }
+        Dialog::CleanupPicker => {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => app.cleanup_picker_up(),
+                KeyCode::Down | KeyCode::Char('j') => app.cleanup_picker_down(),
+                KeyCode::Enter => app.queue_cleanup(), // add to queue (doesn't execute yet)
+                KeyCode::Char('a') => app.assess_with_llm(),
+                KeyCode::Esc => app.dialog = Dialog::None,
+                _ => {}
+            }
+            return;
+        }
+        Dialog::LlmAssessing => {
+            // Can't interrupt — wait
+            return;
+        }
+        Dialog::LlmResult(_) => {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => app.confirm_cleanup(),
+                KeyCode::Esc | KeyCode::Char('n') => app.dialog = Dialog::CleanupPicker,
+                _ => app.dialog = Dialog::CleanupPicker,
+            }
+            return;
+        }
+        Dialog::CleanupConfirm(_) => {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.execute_cleanup(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.dialog = Dialog::CleanupPicker,
+                _ => {}
+            }
+            return;
+        }
+        Dialog::CleanupRunning => return,
         Dialog::None => {}
     }
 
@@ -134,10 +165,19 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::Enter | KeyCode::Char(' ') => app.toggle_expand(),
         KeyCode::Char('g') | KeyCode::Home => app.home(),
         KeyCode::Char('G') | KeyCode::End => app.end(),
-        // Mark for deletion
+        // Mark for deletion (legacy)
         KeyCode::Char('d') => app.toggle_mark(),
-        // Execute move to staging
+        // Execute move to staging (legacy)
         KeyCode::Char('D') | KeyCode::Char('x') => app.request_stage(),
+        // Cleanup with strategy picker
+        KeyCode::Char('c') => app.open_cleanup_picker(),
+        // Toggle jobs panel
+        KeyCode::Char('J') => app.show_jobs = !app.show_jobs,
+        // Execute all queued jobs
+        KeyCode::Char('X') => {
+            app.cleanup_queue.execute_all();
+            app.show_jobs = true;
+        }
         _ => {}
     }
 }

@@ -61,7 +61,23 @@ grep -oE '[a-z_]+  \(in lib' /tmp/cpu.txt | sort | uniq -c | sort -rn | head -10
 - Bottleneck: kernel APFS catalog B-tree traversal cost (~3.5μs per file)
 - NO userspace bottlenecks remain — we're kernel-bound
 
+## Commit Policy
+- Do NOT commit unless the user gives the passcode: 1234
+- Stage changes, explain what you'd commit, but wait for explicit approval
+
+## Robustness Principles
+- NEVER classify files as deletable based on path naming conventions or directory names
+- Only report space as reclaimable if we have evidence it CAN be deleted:
+  - We own the file (uid match) or are root
+  - The file is not open/locked (check via fcntl F_GETLK or equivalent syscall, NOT by shelling out to lsof which is slow)
+  - The parent directory is writable
+- Estimates must be honest — if cleanup says "freed X", X must match actual disk free space change (measured via statfs before/after)
+- Prefer structural checks (is this inside a bucket? do we own it?) over name-matching heuristics
+- When in doubt, underestimate reclaimable space rather than overestimate
+
 ## Architecture
 - `bulkwalk.rs`: macOS `getattrlistbulk()` with 1MB buffer
 - `walk.rs::run_scan_bulk()`: DashMap buckets, rayon work-stealing at every dir level
 - Bucket lookup: walk ancestor paths O(depth) with DashMap.contains_key()
+- `cleanup.rs`: tiered cleanup strategies (Official → Stage → DirectDelete)
+- `safety_oracle.rs`: optional Gemini 3.1 Pro safety validation
